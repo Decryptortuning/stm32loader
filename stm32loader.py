@@ -205,7 +205,10 @@ class CommandInterface:
             crc = N ^ 0xFF
             self.sp.write(bytes([N, crc]))
             self._wait_for_ask("0x11 length failed")
-            return list(self.sp.read(lng))
+            data = self.sp.read(lng)
+            if len(data) != lng:
+                raise CmdException("Short read: expected %d bytes, received %d" % (lng, len(data)))
+            return list(data)
         else:
             raise CmdException("ReadMemory (0x11) failed")
 
@@ -413,7 +416,11 @@ def usage():
     """ % sys.argv[0])
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    global QUIET
+    if argv is None:
+        argv = sys.argv[1:]
+
 
     # Import Psyco if available
     try:
@@ -438,7 +445,7 @@ if __name__ == "__main__":
 # http://www.python.org/doc/2.5.2/lib/module-getopt.html
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hqVewuvrs:p:b:a:l:g:")
+        opts, args = getopt.getopt(argv, "hqVewuvrs:p:b:a:l:g:")
     except getopt.GetoptError as err:
         # print help information and exit:
         print(str(err)) # will print something like "option -a not recognized"
@@ -468,17 +475,33 @@ if __name__ == "__main__":
         elif o == '-p':
             conf['port'] = a
         elif o == '-b':
-            conf['baud'] = eval(a)
+            conf['baud'] = int(a, 0)
         elif o == '-a':
-            conf['address'] = eval(a)
+            conf['address'] = int(a, 0)
         elif o == '-g':
-            conf['go_addr'] = eval(a)
+            conf['go_addr'] = int(a, 0)
         elif o == '-l':
-            conf['len'] = eval(a)
+            conf['len'] = int(a, 0)
         elif o == '-u':
             conf['unprotect'] = 1
         else:
             assert False, "unhandled option"
+
+    # Validate selected files and lengths before entering the ROM bootloader.
+    if conf['write'] or conf['verify'] or conf['read']:
+        if len(args) != 1:
+            raise ValueError("Exactly one firmware/input-output filename is required")
+    if conf['write'] or conf['verify']:
+        with open(args[0], 'rb') as stream:
+            data = list(stream.read())
+        if not data:
+            raise ValueError("Firmware file must not be empty")
+    if conf['read'] and (not conf.get('len') or conf['len'] <= 0):
+        raise ValueError("Read length must be positive")
+    if conf['baud'] <= 0:
+        raise ValueError("Baud rate must be positive")
+    if 'erase-sectors' in conf and int(conf['erase-sectors']) <= 0:
+        raise ValueError("Erase sector count must be positive")
 
     cmd = CommandInterface()
     cmd.open(conf['port'], conf['baud'])
@@ -488,7 +511,6 @@ if __name__ == "__main__":
             cmd.initChip()
         except:
             mdebug(0, "Can't init. Ensure that BOOT0 is enabled and reset device")
-            cmd.releaseChip()
             sys.exit(1)
 
         bootversion = cmd.cmdGet()
@@ -500,9 +522,6 @@ if __name__ == "__main__":
 #    cmd.cmdReadoutUnprotect()
 #    cmd.cmdWriteUnprotect()
 #    cmd.cmdWriteProtect([0, 1])
-
-        if (conf['write'] or conf['verify']):
-            data = list(open(args[0], 'rb').read())
 
         try:
             if conf['erase']:
@@ -534,6 +553,8 @@ if __name__ == "__main__":
             if(data == verify):
                 print("Verification OK")
             else:
+                if len(data) != len(verify):
+                    raise CmdException("Firmware verification short read: expected %d bytes, received %d" % (len(data), len(verify)))
                 print("Verification FAILED")
                 print(str(len(data)) + ' vs ' + str(len(verify)))
                 imax = len(data)
@@ -542,6 +563,8 @@ if __name__ == "__main__":
                 for i in range(0, imax):
                     if data[i] != verify[i]:
                         print(hex(i) + ': ' + hex(data[i]) + ' vs ' + hex(verify[i]))
+
+                raise CmdException("Firmware verification failed")
 
         if not conf['write'] and conf['read']:
             rdata = cmd.readMemory(conf['address'], conf['len'])
@@ -552,3 +575,9 @@ if __name__ == "__main__":
 
     finally:
         cmd.releaseChip()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
