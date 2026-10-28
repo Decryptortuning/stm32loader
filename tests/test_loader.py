@@ -43,7 +43,69 @@ class LoaderTests(unittest.TestCase):
                     else:
                         self.assertEqual(loader.main(['-v', str(firmware)]), 0)
                 command.releaseChip.assert_called_once()
+                command.sp.close.assert_called_once()
                 command.cmdReadoutUnprotect.assert_not_called()
+
+    def test_standard_page_erase_preserves_page_127(self):
+        command = loader.CommandInterface()
+        command.sp = Mock()
+        with patch.object(command, 'cmdGeneric'), patch.object(command, '_wait_for_ask'):
+            command.cmdEraseMemory(range(127))
+        frame = b''.join(call.args[0] for call in command.sp.write.call_args_list)
+        self.assertEqual(frame, bytes([126]) + bytes(range(127)) + b"\x01")
+
+    def test_extended_page_erase_never_becomes_mass_erase(self):
+        command = loader.CommandInterface()
+        command.extended_erase = 1
+        command.sp = Mock(timeout=5)
+        with patch.object(command, 'cmdGeneric') as generic, patch.object(command, '_wait_for_ask'):
+            command.cmdEraseMemory(range(127))
+        generic.assert_called_once_with(0x44)
+        frame = command.sp.write.call_args.args[0]
+        self.assertEqual(frame[:2], b"\x00\x7e")
+        pages = [int.from_bytes(frame[i:i+2], 'big') for i in range(2, len(frame)-1, 2)]
+        self.assertEqual(pages, list(range(127)))
+        self.assertNotIn(127, pages)
+        self.assertEqual(len(frame), 257)
+        from functools import reduce
+        from operator import xor
+        self.assertEqual(reduce(xor, frame), 0)
+        self.assertEqual(command.sp.timeout, 5)
+
+    def test_invalid_erase_pages_send_nothing(self):
+        for extended in (0, 1):
+            for pages in ([], [-1], [65536]):
+                command = loader.CommandInterface()
+                command.extended_erase = extended
+                command.sp = Mock()
+                with patch.object(command, 'cmdGeneric') as generic, self.assertRaises(ValueError):
+                    command.cmdEraseMemory(pages)
+                generic.assert_not_called()
+                command.sp.write.assert_not_called()
+
+    def test_extended_timeout_restored_on_nack(self):
+        command = loader.CommandInterface()
+        command.sp = Mock(timeout=5)
+        with patch.object(command, 'cmdGeneric'), patch.object(command, '_wait_for_ask', side_effect=loader.CmdException('NACK')):
+            with self.assertRaises(loader.CmdException):
+                command.cmdExtendedEraseMemory([0])
+        self.assertEqual(command.sp.timeout, 5)
+
+    def test_cleanup_closes_uart_even_if_reset_fails(self):
+        command = Mock()
+        command.cmdGet.return_value = 0x22
+        command.cmdGetID.return_value = 0x414
+        command.releaseChip.side_effect = RuntimeError('reset failed')
+        with patch.object(loader, 'CommandInterface', return_value=command), self.assertRaises(RuntimeError):
+            loader.main([])
+        command.sp.close.assert_called_once()
+
+    def test_get_id_short_reply_fails(self):
+        command = loader.CommandInterface()
+        command.sp = Mock()
+        command.sp.read.side_effect = [b"\x01", b"\x04"]
+        with patch.object(command, 'cmdGeneric'), self.assertRaisesRegex(loader.CmdException, 'Short read'):
+            command.cmdGetID()
 
     def test_invalid_input_never_enters_bootloader(self):
         with tempfile.TemporaryDirectory() as directory:

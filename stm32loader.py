@@ -69,8 +69,16 @@ class CommandInterface:
             stopbits=1,
             xonxoff=0,              # don't enable software flow control
             rtscts=0,               # don't enable RTS/CTS flow control
-            timeout=5               # set a timeout value, None for waiting forever
+            timeout=5,
+            write_timeout=5,
+            exclusive=True         # refuse a second cooperating serial owner
         )
+
+    def _read_exact(self, length):
+        data = self.sp.read(length)
+        if len(data) != length:
+            raise CmdException("Short read: expected %d bytes, received %d" % (length, len(data)))
+        return data
 
     def _read_byte(self):
         b = self.sp.read(1)
@@ -155,7 +163,7 @@ class CommandInterface:
             length = self._read_byte()
             version = self._read_byte()
             mdebug(10, "    Bootloader version: "+hex(version))
-            dat = [hex(b) for b in self.sp.read(length)]
+            dat = [hex(b) for b in self._read_exact(length)]
             if '0x44' in dat:
                 self.extended_erase = 1
             mdebug(10, "    Available commands: "+", ".join(dat))
@@ -168,7 +176,7 @@ class CommandInterface:
         if self.cmdGeneric(0x01):
             mdebug(10, "*** GetVersion command")
             version = self._read_byte()
-            self.sp.read(2)
+            self._read_exact(2)
             self._wait_for_ask("0x01 end")
             mdebug(10, "    Bootloader version: "+hex(version))
             return version
@@ -179,7 +187,7 @@ class CommandInterface:
         if self.cmdGeneric(0x02):
             mdebug(10, "*** GetID command")
             length = self._read_byte()
-            chip_id_bytes = self.sp.read(length + 1)
+            chip_id_bytes = self._read_exact(length + 1)
             self._wait_for_ask("0x02 end")
             return int.from_bytes(chip_id_bytes, "big")
         else:
@@ -251,8 +259,14 @@ class CommandInterface:
             mdebug(0, "simulating error")
             raise CmdException("simulation error")
 
+        if sectors is not None:
+            sectors = list(sectors)
+            limit = 0xFFF0 if self.extended_erase else 255
+            max_page = 0xFFFF if self.extended_erase else 255
+            if not sectors or len(sectors) > limit or any(type(x) is not int or not 0 <= x <= max_page for x in sectors):
+                raise ValueError("Invalid erase page list")
         if self.extended_erase:
-            return self.cmdExtendedEraseMemory()
+            return self.cmdExtendedEraseMemory(sectors)
 
         if self.cmdGeneric(0x43):
             mdebug(10, "*** Erase memory command")
@@ -276,21 +290,27 @@ class CommandInterface:
         else:
             raise CmdException("Erase memory (0x43) failed")
 
-    def cmdExtendedEraseMemory(self):
-        if self.cmdGeneric(0x44):
-            mdebug(10, "*** Extended Erase memory command")
-            # Global mass erase
-            self.sp.write(bytes([0xFF, 0xFF]))
-            # Checksum
-            self._write_byte(0x00)
-            tmp = self.sp.timeout
-            self.sp.timeout = 30
-            print("Extended erase (0x44), this can take ten seconds or more")
-            self._wait_for_ask("0x44 erasing failed")
-            self.sp.timeout = tmp
-            mdebug(10, "    Extended Erase memory done")
+    def cmdExtendedEraseMemory(self, sectors=None):
+        # AN3155: 16-bit MSB-first count-minus-one and page codes, then XOR.
+        if sectors is None:
+            payload = b"\xff\xff"
         else:
-            raise CmdException("Extended Erase memory (0x44) failed")
+            sectors = list(sectors)
+            if not sectors or len(sectors) > 0xFFF0 or any(type(x) is not int or not 0 <= x <= 0xFFFF for x in sectors):
+                raise ValueError("Invalid extended erase page list")
+            payload = (len(sectors) - 1).to_bytes(2, "big")
+            payload += b"".join(x.to_bytes(2, "big") for x in sectors)
+        checksum = 0
+        for value in payload:
+            checksum ^= value
+        self.cmdGeneric(0x44)
+        previous_timeout = self.sp.timeout
+        try:
+            self.sp.timeout = 30
+            self.sp.write(payload + bytes([checksum]))
+            self._wait_for_ask("0x44 erasing failed")
+        finally:
+            self.sp.timeout = previous_timeout
 
     def cmdWriteProtect(self, sectors):
         if self.cmdGeneric(0x63):
@@ -574,7 +594,10 @@ def main(argv=None):
             cmd.cmdGo(conf['go_addr'])
 
     finally:
-        cmd.releaseChip()
+        try:
+            cmd.releaseChip()
+        finally:
+            cmd.sp.close()
 
     return 0
 
