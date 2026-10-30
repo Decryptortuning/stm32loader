@@ -120,3 +120,57 @@ class LoaderTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ArtooJournalTests(unittest.TestCase):
+    def image(self):
+        import struct
+        return struct.pack('<II',0x2000c000,0x08000141)+b'\0'*296+loader.ARTOO_LAYOUT+b'\0'*64
+
+    def command(self):
+        command=Mock();command.cmdGet.return_value=0x22;command.cmdGetID.return_value=0x414
+        image=self.image();pages=b'\xff'*4096
+        def read(addr,size):
+            return list({(0x1ffff7e0,2):b'\0\x01',(0x1ffff800,4):b'\xa5\x5a\xff\0',
+                         (0x0803f000,4096):pages,(0x08000000,len(image)):image}[(addr,size)])
+        command.readMemory.side_effect=read
+        return command
+
+    def test_guarded_update_preserves_two_pages_before_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image=Path(tmp)/'image.bin';image.write_bytes(self.image());command=self.command()
+            with patch.object(loader,'CommandInterface',return_value=command):
+                self.assertEqual(loader.main(['--artoo','--artoo-backup-dir',tmp,'-wv','-s','126',str(image)]),0)
+            self.assertEqual(list(command.cmdEraseMemory.call_args.args[0]),list(range(126)))
+            self.assertEqual(list(Path(tmp).glob('artoo-pages-*'))[0].read_bytes(),b'\xff'*4096)
+            command.releaseChip.assert_called_once();command.cmdReadoutUnprotect.assert_not_called()
+
+    def test_reject_incompatible_flags_and_legacy_before_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image=Path(tmp)/'image.bin';image.write_bytes(self.image())
+            for flags in [['-wv','-s','127'],['-wvu','-s','126'],['-wve','-s','126'],['-w','-s','126']]:
+                with patch.object(loader,'CommandInterface') as ctor,self.assertRaises(ValueError):
+                    loader.main(['--artoo','--artoo-backup-dir',tmp,*flags,str(image)])
+                ctor.assert_not_called()
+            image.write_bytes(b'x'*384)
+            with patch.object(loader,'CommandInterface') as ctor,self.assertRaises(ValueError):
+                loader.main(['--artoo','--artoo-backup-dir',tmp,'-wv','-s','126',str(image)])
+            ctor.assert_not_called()
+
+    def test_programming_failure_stays_in_rom_and_closes_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image=Path(tmp)/'image.bin';image.write_bytes(self.image());command=self.command()
+            command.writeMemory.side_effect=loader.CmdException('NACK')
+            with patch.object(loader,'CommandInterface',return_value=command),self.assertRaises(loader.CmdException):
+                loader.main(['--artoo','--artoo-backup-dir',tmp,'-wv','-s','126',str(image)])
+            command.releaseChip.assert_not_called();command.sp.close.assert_called_once()
+
+    def test_bad_geometry_or_unknown_storage_never_erases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image=Path(tmp)/'image.bin';image.write_bytes(self.image())
+            for address,bad in [(0x1ffff7e0,b'\0\x02'),(0x1ffff800,b'\xa5\x5a\0\xff'),(0x0803f000,b'x'*4096)]:
+                command=self.command();good=command.readMemory.side_effect
+                command.readMemory.side_effect=lambda a,n: list(bad) if a==address else good(a,n)
+                with patch.object(loader,'CommandInterface',return_value=command),self.assertRaises(loader.CmdException):
+                    loader.main(['--artoo','--artoo-backup-dir',tmp,'-wv','-s','126',str(image)])
+                command.cmdEraseMemory.assert_not_called();command.writeMemory.assert_not_called()

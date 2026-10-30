@@ -26,6 +26,8 @@ import sys, getopt
 import serial
 import time
 import os
+import struct
+import tempfile
 
 try:
     from progressbar import *
@@ -436,6 +438,66 @@ def usage():
     """ % sys.argv[0])
 
 
+ARTOO_LAYOUT = b'OS5JNL1!' + struct.pack('<IHH', 0x0803f000, 172, 1)
+
+
+def validate_artoo_image(data):
+    data = bytes(data)
+    if not 320 <= len(data) <= 0x3f000 or data[304:320] != ARTOO_LAYOUT:
+        raise ValueError("Artoo requires a journal-v1 image below page126; legacy downgrade forbidden")
+    sp, pc = struct.unpack_from('<II', data)
+    if not (0x20000000 < sp <= 0x2000c000 and sp % 8 == 0 and
+            pc & 1 and 0x08000000 <= (pc & ~1) < 0x08000000 + len(data)):
+        raise ValueError("Invalid Artoo image vectors")
+
+
+def art_param_record(page):
+    if len(page) != 2048 or page[:4] != b'OSJ1' or page[4:8] != b'\x01\x00\xac\x00' or page[188:192] != b'\x5a\xa5\xff\xff':
+        return None
+    crc = 0xffffffff
+    for value in page[:12] + page[16:188]:
+        crc ^= value
+        for _ in range(8): crc = (crc >> 1) ^ (0xedb88320 if crc & 1 else 0)
+    if struct.unpack_from('<I',page,12)[0] != (crc ^ 0xffffffff): return None
+    return struct.unpack_from('<I',page,8)[0], page[16:188]
+
+
+def classify_artoo_pages(saved):
+    if len(saved) != 4096: raise CmdException("Short parameter pages")
+    a,b = saved[:2048],saved[2048:]
+    ar,br = art_param_record(a),art_param_record(b)
+    if ar and br:
+        delta=(ar[0]-br[0]) & 0xffffffff
+        if delta==0x80000000 or (delta==0 and ar[1]!=br[1]):
+            raise CmdException("Ambiguous parameter generations")
+        return ar[1] if delta<0x80000000 else br[1]
+    if ar or br: return (ar or br)[1]
+    if b[:4]==b'OSJ1' or b[172:] != b'\xff'*(2048-172):
+        raise CmdException("Corrupt/unknown journal; preserve for explicit recovery")
+    return b[:172]
+
+
+def preserve_artoo_pages(cmd, chip, directory):
+    if chip != 0x414 or bytes(cmd.readMemory(0x1ffff7e0, 2)) != b'\x00\x01':
+        raise CmdException("Artoo requires verified high-density256KiB geometry")
+    # USER option-byte bit0 selects software IWDG; never change option bytes.
+    options = bytes(cmd.readMemory(0x1ffff800, 4))
+    if len(options) != 4 or not options[2] & 1:
+        raise CmdException("Hardware-start watchdog mode is not qualified for ROM updates")
+    saved = bytes(cmd.readMemory(0x0803f000, 4096))
+    if len(saved) != 4096:
+        raise CmdException("Short parameter journal read")
+    classify_artoo_pages(saved)
+    fd, path = tempfile.mkstemp(prefix='artoo-pages-', suffix='.bin', dir=directory)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(saved); stream.flush(); os.fsync(stream.fileno())
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+    print("Preserved parameter pages: " + path)
+    return saved
+
+
 def main(argv=None):
     global QUIET
     if argv is None:
@@ -465,7 +527,7 @@ def main(argv=None):
 # http://www.python.org/doc/2.5.2/lib/module-getopt.html
 
     try:
-        opts, args = getopt.getopt(argv, "hqVewuvrs:p:b:a:l:g:")
+        opts, args = getopt.getopt(argv, "hqVewuvrs:p:b:a:l:g:", ["artoo", "artoo-backup-dir="])
     except getopt.GetoptError as err:
         # print help information and exit:
         print(str(err)) # will print something like "option -a not recognized"
@@ -475,7 +537,11 @@ def main(argv=None):
     QUIET = 5
 
     for o, a in opts:
-        if o == '-V':
+        if o == '--artoo':
+            conf['artoo'] = True
+        elif o == '--artoo-backup-dir':
+            conf['artoo-backup-dir'] = a
+        elif o == '-V':
             QUIET = 10
         elif o == '-q':
             QUIET = 0
@@ -523,6 +589,16 @@ def main(argv=None):
     if 'erase-sectors' in conf and int(conf['erase-sectors']) <= 0:
         raise ValueError("Erase sector count must be positive")
 
+    if conf.get('artoo'):
+        if (not conf['write'] or not conf['verify'] or conf['erase'] or conf['unprotect'] or
+                conf['read'] or conf['address'] != 0x08000000 or conf['go_addr'] != -1 or
+                int(conf.get('erase-sectors', 0)) != 126 or not conf.get('artoo-backup-dir')):
+            raise ValueError("Artoo mode requires -wv -s126, backup directory, no mass erase/unprotect/Go")
+        validate_artoo_image(data)
+    elif (conf['write'] or conf['verify']) and bytes(data[304:320]) == ARTOO_LAYOUT:
+        raise ValueError("Journal firmware requires --artoo guarded programming")
+    mutation_started = False
+    art_success = False
     cmd = CommandInterface()
     cmd.open(conf['port'], conf['baud'])
     mdebug(10, "Open port %(port)s, baud %(baud)d" % {'port':conf['port'], 'baud':conf['baud']})
@@ -543,6 +619,10 @@ def main(argv=None):
 #    cmd.cmdWriteUnprotect()
 #    cmd.cmdWriteProtect([0, 1])
 
+        saved_pages = None
+        if conf.get('artoo'):
+            saved_pages = preserve_artoo_pages(cmd, id, conf['artoo-backup-dir'])
+            mutation_started = True
         try:
             if conf['erase']:
                 cmd.cmdEraseMemory()
@@ -562,8 +642,8 @@ def main(argv=None):
             else:
                 # can't continue on
                 mdebug(0, "EraseMemory failed, quitting")
-                cmd.releaseChip()
-                sys.exit(1)
+                if not conf.get("artoo"): cmd.releaseChip()
+                raise CmdException("Erase failed; no automatic retry")
 
         if conf['write']:
             cmd.writeMemory(conf['address'], data)
@@ -586,6 +666,11 @@ def main(argv=None):
 
                 raise CmdException("Firmware verification failed")
 
+        if conf.get('artoo'):
+            if bytes(cmd.readMemory(0x0803f000, 4096)) != saved_pages:
+                raise CmdException("Parameter pages changed; retaining ROM for recovery")
+            art_success = True
+
         if not conf['write'] and conf['read']:
             rdata = cmd.readMemory(conf['address'], conf['len'])
             open(args[0], 'wb').write(bytes(rdata))
@@ -595,7 +680,8 @@ def main(argv=None):
 
     finally:
         try:
-            cmd.releaseChip()
+            if not conf.get("artoo") or not mutation_started or art_success:
+                cmd.releaseChip()
         finally:
             cmd.sp.close()
 
