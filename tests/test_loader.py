@@ -174,3 +174,18 @@ class ArtooJournalTests(unittest.TestCase):
                 with patch.object(loader,'CommandInterface',return_value=command),self.assertRaises(loader.CmdException):
                     loader.main(['--artoo','--artoo-backup-dir',tmp,'-wv','-s','126',str(image)])
                 command.cmdEraseMemory.assert_not_called();command.writeMemory.assert_not_called()
+
+
+class ExistingJournalGuardTests(unittest.TestCase):
+    def test_generic_legacy_erase_unprotect_and_write_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image=Path(tmp)/'old.bin';image.write_bytes(b'legacy')
+            for installed, pages in [(loader.ARTOO_LAYOUT,b'\xff'*4096),
+                                     (b'\xff'*16,b'OSJ1'+b'\xff'*4092),
+                                     (b'\xff'*16,b'\xff'*2048+b'OSJ1'+b'\xff'*2044)]:
+                for flags in [['-wv','-s','127',str(image)],['-e'],['-eu'],['-w',str(image)]]:
+                    command=Mock();command.cmdGet.return_value=0x22;command.cmdGetID.return_value=0x414
+                    command.readMemory.side_effect=lambda a,n:list({0x1ffff7e0:b'\0\x01',0x08000130:installed,0x0803f000:pages}[a])
+                    with patch.object(loader,'CommandInterface',return_value=command),self.assertRaisesRegex(loader.CmdException,'requires --artoo'):
+                        loader.main(flags)
+                    command.cmdEraseMemory.assert_not_called();command.writeMemory.assert_not_called();command.cmdReadoutUnprotect.assert_not_called()

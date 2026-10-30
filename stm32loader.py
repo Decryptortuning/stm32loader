@@ -477,6 +477,19 @@ def classify_artoo_pages(saved):
     return b[:172]
 
 
+def reject_generic_artoo_mutation(cmd, chip):
+    if chip != 0x414: return
+    geometry = bytes(cmd.readMemory(0x1ffff7e0, 2))
+    if len(geometry) != 2: raise CmdException("Cannot identify flash geometry before mutation")
+    if geometry != b'\x00\x01': return
+    marker = bytes(cmd.readMemory(0x08000130, 16))
+    pages = bytes(cmd.readMemory(0x0803f000, 4096))
+    if len(marker) != 16 or len(pages) != 4096:
+        raise CmdException("Cannot inspect existing Artoo storage before mutation")
+    if marker.startswith(b'OS5JNL') or pages[:4]==b'OSJ1' or pages[2048:2052]==b'OSJ1':
+        raise CmdException("Existing Artoo journal layout requires --artoo; generic mutation/downgrade forbidden")
+
+
 def preserve_artoo_pages(cmd, chip, directory):
     if chip != 0x414 or bytes(cmd.readMemory(0x1ffff7e0, 2)) != b'\x00\x01':
         raise CmdException("Artoo requires verified high-density256KiB geometry")
@@ -619,6 +632,8 @@ def main(argv=None):
 #    cmd.cmdWriteUnprotect()
 #    cmd.cmdWriteProtect([0, 1])
 
+        if not conf.get('artoo') and (conf['write'] or conf['erase'] or conf['unprotect'] or 'erase-sectors' in conf):
+            reject_generic_artoo_mutation(cmd, id)
         saved_pages = None
         if conf.get('artoo'):
             saved_pages = preserve_artoo_pages(cmd, id, conf['artoo-backup-dir'])
